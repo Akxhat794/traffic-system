@@ -1,0 +1,44 @@
+name: Build Android APK
+
+# Runs every time you upload changes, or when you click "Run workflow"
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get your files
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install app tools
+        run: npm install
+
+      - name: Create the Android project
+        run: |
+          npx cap add android
+          npx cap sync android
+
+      - name: Build the APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Save the APK so you can download it
+        uses: actions/upload-artifact@v4
+        with:
+          name: traffic-app-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk

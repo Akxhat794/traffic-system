@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live Traffic Map</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1d2b2a">
+<link rel="apple-touch-icon" href="icon-192.png">
+<!-- Leaflet = a free library that shows a real map -->
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<style>
+  :root { --bg:#eef2f1; --ink:#1d2b2a; --green:#2f9e6b; --amber:#e0a21a; --red:#d6453d; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px 16px 40px; background:var(--bg); color:var(--ink);
+         font-family: Georgia, "Times New Roman", serif; line-height:1.5; }
+  main { max-width:900px; margin:0 auto; }
+  h1 { margin:0 0 4px; font-size:2rem; }
+  .sub { margin:0 0 18px; color:#52625f; }
+  .panel { background:#fff; border-radius:10px; padding:18px; margin-bottom:16px; }
+  label { display:block; font-weight:bold; margin-bottom:6px; }
+  input { width:100%; padding:10px; font-size:1rem; border:1px solid #b9c6c3; border-radius:6px; }
+  .row { display:grid; gap:14px; grid-template-columns:1fr 1fr; margin-bottom:12px; }
+  @media (max-width:600px) { .row { grid-template-columns:1fr; } }
+  button { padding:12px 22px; font-size:1rem; font-weight:bold; border:0; border-radius:6px;
+           background:var(--ink); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:wait; }
+  button:focus-visible, input:focus-visible { outline:3px solid var(--amber); }
+  #map { height:440px; border-radius:10px; margin-bottom:14px; }
+  .result { display:grid; gap:12px; grid-template-columns:repeat(3,1fr); text-align:center; }
+  @media (max-width:600px) { .result { grid-template-columns:1fr; } }
+  .result div { padding:10px; border-radius:8px; background:var(--bg); }
+  .big { font-size:2rem; font-weight:bold; display:block; }
+  #delayBox { color:#fff; background:var(--green); transition:background .4s; }
+  .error { color:var(--red); font-weight:bold; }
+  small { color:#52625f; }
+  [hidden] { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Live Traffic Map</h1>
+  <p class="sub">Enter two places. See the route on a real map, with live traffic on the roads and the travel time with and without traffic.</p>
+
+  <section class="panel">
+    <label for="apiKey">TomTom API key (optional)</label>
+    <input id="apiKey" type="password" placeholder="Paste your free key here">
+    <small>Leave empty to use estimated traffic (based on time of day). Add a free key from developer.tomtom.com for live traffic. Saved only in your own browser.</small>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <div><label for="from">From</label><input id="from" placeholder="e.g. Charbagh Railway Station, Lucknow"></div>
+      <div><label for="to">To</label><input id="to" placeholder="e.g. Hazratganj, Lucknow"></div>
+    </div>
+    <button id="go">Check traffic now</button>
+    <p id="message" aria-live="polite" style="margin:10px 0 0"></p>
+  </section>
+
+  <div id="map"></div>
+
+  <section class="panel" id="results" hidden>
+    <div class="result">
+      <div><span class="big" id="normalTime">-</span>Without traffic</div>
+      <div><span class="big" id="trafficTime">-</span>Right now</div>
+      <div id="delayBox"><span class="big" id="delay">-</span>Traffic delay</div>
+    </div>
+    <p id="summary" style="margin-bottom:0"></p>
+  </section>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<script>
+  // ---------- 1. SETTINGS ----------
+  const START_VIEW = [26.8467, 80.9462]; // map opens here (Lucknow). Change if you like.
+
+  // ---------- 2. ELEMENTS ----------
+  const keyInput = document.getElementById("apiKey");
+  const goButton = document.getElementById("go");
+  const message = document.getElementById("message");
+  try { keyInput.value = localStorage.getItem("tomtomKey") || ""; } catch (e) {}
+
+  // ---------- 3. THE MAP ----------
+  const map = L.map("map").setView(START_VIEW, 12);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap contributors | Traffic &copy; TomTom"
+  }).addTo(map);
+
+  let trafficLayer = null;                 // coloured traffic on roads
+  const routeGroup = L.layerGroup().addTo(map); // our route and markers
+
+  // Adds live traffic colours (green/orange/red) over the map roads
+  function addTrafficLayer(key) {
+    if (trafficLayer) map.removeLayer(trafficLayer);
+    trafficLayer = L.tileLayer(
+      "https://api.tomtom.com/traffic/map/4/tile/flow/relative/{z}/{x}/{y}.png?key=" + key,
+      { opacity: 0.75, maxZoom: 19 }
+    ).addTo(map);
+  }
+
+  // ---------- 4. HELPERS TO TALK TO TOMTOM ----------
+  async function findPlace(name, key) {
+    const url = "https://api.tomtom.com/search/2/geocode/" + encodeURIComponent(name) + ".json?limit=1&key=" + key;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Could not search for '" + name + "'. Check your API key.");
+    const data = await res.json();
+    if (!data.results || data.results.length === 0) throw new Error("Place not found: " + name + ". Try adding the city name.");
+    return data.results[0].position; // { lat, lon }
+  }
+
+  async function getRoute(a, b, key) {
+    const url = "https://api.tomtom.com/routing/1/calculateRoute/" +
+      a.lat + "," + a.lon + ":" + b.lat + "," + b.lon +
+      "/json?traffic=true&computeTravelTimeFor=all&key=" + key;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Could not get a route between these places.");
+    const data = await res.json();
+    return data.routes[0];
+  }
+
+  // ---------- 4b. NO-KEY VERSION (free public services) ----------
+  // Nominatim turns a place name into a location. OSRM finds the road route. Neither needs a key.
+  async function findPlaceFree(name) {
+    const res = await fetch("https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" + encodeURIComponent(name));
+    if (!res.ok) throw new Error("Could not search for '" + name + "'.");
+    const data = await res.json();
+    if (data.length === 0) throw new Error("Place not found: " + name + ". Try adding the city name.");
+    return { lat: Number(data[0].lat), lon: Number(data[0].lon) };
+  }
+
+  async function getRouteFree(a, b) {
+    const url = "https://router.project-osrm.org/route/v1/driving/" + a.lon + "," + a.lat + ";" + b.lon + "," + b.lat +
+                "?overview=full&geometries=geojson";
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Could not get a route between these places.");
+    const data = await res.json();
+    if (!data.routes || data.routes.length === 0) throw new Error("No road route found between these places.");
+    const r = data.routes[0];
+    // How much slower is traffic at this hour? (simple estimate, not live data)
+    const hour = new Date().getHours();
+    let factor = 1.2;                               // night
+    if (hour < 7) factor = 1.0;                     // late night / early morning
+    else if (hour < 8) factor = 1.3;                // morning
+    else if (hour < 11) factor = 1.5;               // morning rush
+    else if (hour < 16) factor = 1.15;              // midday
+    else if (hour < 20) factor = 1.8;               // evening rush
+    // Return in the same shape as the TomTom answer so one function can show both
+    return {
+      summary: {
+        lengthInMeters: r.distance,
+        noTrafficTravelTimeInSeconds: r.duration,
+        travelTimeInSeconds: r.duration * factor
+      },
+      legs: [{ points: r.geometry.coordinates.map(c => ({ latitude: c[1], longitude: c[0] })) }],
+      estimated: true
+    };
+  }
+
+  // ---------- 5. BUTTON CLICK ----------
+  goButton.addEventListener("click", async function () {
+    const key = keyInput.value.trim();
+    const from = document.getElementById("from").value.trim();
+    const to = document.getElementById("to").value.trim();
+
+    message.className = "";
+    if (!from || !to) { return showError("Please enter both places."); }
+
+    try { localStorage.setItem("tomtomKey", key); } catch (e) {}
+    goButton.disabled = true;
+    message.textContent = key ? "Checking live traffic..." : "Finding route...";
+
+    try {
+      let route;
+      if (key) {                                   // LIVE mode
+        const a = await findPlace(from, key);
+        const b = await findPlace(to, key);
+        route = await getRoute(a, b, key);
+        addTrafficLayer(key);
+      } else {                                     // ESTIMATE mode (no key)
+        const a = await findPlaceFree(from);
+        const b = await findPlaceFree(to);
+        route = await getRouteFree(a, b);
+        if (trafficLayer) { map.removeLayer(trafficLayer); trafficLayer = null; }
+      }
+      showResult(route);
+      message.textContent = "";
+    } catch (err) {
+      showError(err.message);
+    }
+    goButton.disabled = false;
+  });
+
+  function showError(text) { message.className = "error"; message.textContent = text; }
+
+  // ---------- 6. SHOW TIMES + DRAW ROUTE ----------
+  function showResult(route) {
+    const s = route.summary;
+    const normalMin = Math.round(s.noTrafficTravelTimeInSeconds / 60);
+    const trafficMin = Math.round(s.travelTimeInSeconds / 60);
+    const delayMin = Math.max(0, trafficMin - normalMin);
+    const km = (s.lengthInMeters / 1000).toFixed(1);
+
+    document.getElementById("results").hidden = false;
+    document.getElementById("normalTime").textContent = normalMin + " min";
+    document.getElementById("trafficTime").textContent = trafficMin + " min";
+    document.getElementById("delay").textContent = "+" + delayMin + " min";
+
+    const ratio = s.noTrafficTravelTimeInSeconds > 0 ? s.travelTimeInSeconds / s.noTrafficTravelTimeInSeconds : 1;
+    let cssColor = "var(--green)", hex = "#2f9e6b", word = "Traffic is light";
+    if (ratio > 1.15) { cssColor = "var(--amber)"; hex = "#e0a21a"; word = "Traffic is moderate"; }
+    if (ratio > 1.4)  { cssColor = "var(--red)";   hex = "#d6453d"; word = "Traffic is heavy"; }
+    document.getElementById("delayBox").style.background = cssColor;
+    document.getElementById("summary").textContent =
+      word + ". The route is " + km + " km. It takes " + normalMin + " min on empty roads and " + trafficMin + " min " +
+      (route.estimated ? "at this time of day (estimate based on typical traffic, not live data)." : "right now (live traffic).");
+
+    // Convert TomTom points into [lat, lon] pairs for the map
+    const path = route.legs[0].points.map(p => [p.latitude, p.longitude]);
+
+    routeGroup.clearLayers();
+    L.polyline(path, { color: "#ffffff", weight: 11, opacity: 0.9 }).addTo(routeGroup); // white outline
+    L.polyline(path, { color: hex, weight: 6 }).addTo(routeGroup);                      // coloured route
+    L.circleMarker(path[0], { radius: 9, color: "#1d2b2a", weight: 3, fillColor: "#1d2b2a", fillOpacity: 1 })
+      .bindTooltip("Start").addTo(routeGroup);
+    L.circleMarker(path[path.length - 1], { radius: 9, color: "#1d2b2a", weight: 3, fillColor: "#ffffff", fillOpacity: 1 })
+      .bindTooltip("Destination").addTo(routeGroup);
+
+    map.fitBounds(L.latLngBounds(path), { padding: [30, 30] });
+  }
+  // ---------- 7. MAKE IT AN INSTALLABLE APP ----------
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").catch(function () {});
+  }
+</script>
+</body>
+</html>
